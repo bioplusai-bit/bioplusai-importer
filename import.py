@@ -1,32 +1,35 @@
 """
-AlphaMissense import service.
-Railway da ishlaydi:
-  1. Zenodo dan fayl yuklab oladi
-  2. Railway PostgreSQL ga import qiladi
-  3. Tugagach o'chadi
+AlphaMissense import service — MinIO dan o'qiydi.
 """
 
 import psycopg2
 import gzip
 import time
 import os
-import requests
-import io
+import urllib.request
 
-# ── Environment variables (Railway da sozlanadi) ──────────────────────────────
-DB_URL    = os.environ.get("DATABASE_URL", "")
-ZENODO_URL = "https://zenodo.org/records/10813168/files/AlphaMissense_hg38.tsv.gz"
+# ── Environment variables ──────────────────────────────────────────────────────
+DB_URL         = os.environ.get("DATABASE_URL", "")
+MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "gondola.proxy.rlwy.net")
+MINIO_PORT     = os.environ.get("MINIO_PORT", "34773")
+MINIO_ACCESS   = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET   = os.environ.get("MINIO_SECRET_KEY", "minioadmin123")
+MINIO_BUCKET   = os.environ.get("MINIO_DATASET_BUCKET", "datasets")
+MINIO_FILE     = os.environ.get("MINIO_AM_FILE", "AlphaMissense_hg38.tsv.gz")
 
 BATCH_SIZE = 20_000
 LOG_EVERY  = 500_000
 
+def get_minio_url():
+    return f"http://{MINIO_ENDPOINT}:{MINIO_PORT}/{MINIO_BUCKET}/{MINIO_FILE}"
+
 def main():
     if not DB_URL:
-        print("DATABASE_URL environment variable topilmadi!")
+        print("DATABASE_URL topilmadi!")
         return
 
     print("=" * 60)
-    print("BioPlusAI — AlphaMissense Import Service")
+    print("BioPlusAI — AlphaMissense Import (MinIO)")
     print("=" * 60)
 
     print("\n1. PostgreSQL ga ulanmoqda...")
@@ -44,7 +47,6 @@ def main():
     """)
     if not cur.fetchone()[0]:
         print("   AlphaMissenseVariants jadvali topilmadi!")
-        print("   Avval migration ishlatib koring.")
         conn.close()
         return
 
@@ -53,25 +55,24 @@ def main():
     print(f"   Hozirgi qatorlar: {existing:,}")
 
     if existing > 1_000_000:
-        print("   Ma'lumotlar allaqachon import qilingan. Chiqilmoqda.")
+        print("   Ma'lumotlar allaqachon import qilingan!")
         conn.close()
         return
 
-    print(f"\n2. Zenodo dan fayl yuklanmoqda...")
-    print(f"   URL: {ZENODO_URL}")
-
-    response = requests.get(ZENODO_URL, stream=True, timeout=300)
-    response.raise_for_status()
-
-    total_size = int(response.headers.get('content-length', 0))
-    print(f"   Hajmi: {total_size / 1024 / 1024:.0f} MB")
+    # MinIO dan o'qish — presigned URL shart emas, public bucket
+    minio_url = get_minio_url()
+    print(f"\n2. MinIO dan o'qilmoqda...")
+    print(f"   URL: {minio_url}")
 
     print(f"\n3. Import boshlandi...")
-    start_time = time.time()
-    total      = 0
-    batch      = []
-    skipped    = 0
-    downloaded = 0
+    start_time   = time.time()
+    total        = 0
+    batch        = []
+    skipped      = 0
+    header_found = False
+
+    col_chrom = col_pos = col_ref = col_alt = None
+    col_score = col_class = col_trans = col_protein = None
 
     insert_sql = """
         INSERT INTO "AlphaMissenseVariants"
@@ -80,17 +81,9 @@ def main():
         ON CONFLICT DO NOTHING
     """
 
-    # Ustun indekslari
-    col_chrom = col_pos = col_ref = col_alt = col_score = col_class = col_trans = col_protein = None
-    header_found = False
-
-    # Stream orqali o'qiymiz — to'liq yuklab olmasdan
-    buffer = b""
-    with requests.get(ZENODO_URL, stream=True, timeout=600) as r:
-        r.raise_for_status()
-
-        # gzip stream
-        gz = gzip.GzipFile(fileobj=r.raw)
+    try:
+        req = urllib.request.urlopen(minio_url, timeout=30)
+        gz  = gzip.GzipFile(fileobj=req)
 
         for raw_line in gz:
             try:
@@ -109,16 +102,17 @@ def main():
                     print(f"   Header: {headers}")
 
                     for i, h in enumerate(headers):
-                        if h in ('chrom', '#chrom'):      col_chrom   = i
-                        elif h == 'pos':                   col_pos     = i
-                        elif h == 'ref':                   col_ref     = i
-                        elif h == 'alt':                   col_alt     = i
-                        elif h == 'am_pathogenicity':      col_score   = i
-                        elif h == 'am_class':              col_class   = i
-                        elif h == 'transcript_id':         col_trans   = i
-                        elif h == 'protein_variant':       col_protein = i
+                        if h in ('chrom', '#chrom'):  col_chrom   = i
+                        elif h == 'pos':               col_pos     = i
+                        elif h == 'ref':               col_ref     = i
+                        elif h == 'alt':               col_alt     = i
+                        elif h == 'am_pathogenicity':  col_score   = i
+                        elif h == 'am_class':          col_class   = i
+                        elif h == 'transcript_id':     col_trans   = i
+                        elif h == 'protein_variant':   col_protein = i
 
                     header_found = True
+                    print(f"   Ustunlar: CHROM={col_chrom}, POS={col_pos}, SCORE={col_score}, CLASS={col_class}")
                 continue
 
             if line.startswith('#'):
@@ -159,6 +153,12 @@ def main():
                 skipped += 1
                 continue
 
+    except Exception as e:
+        print(f"   MinIO xato: {e}")
+        conn.close()
+        return
+
+    # Qolgan batch
     if batch:
         cur.executemany(insert_sql, batch)
         conn.commit()
@@ -170,13 +170,12 @@ def main():
     print(f"   Skip: {skipped:,}")
     print(f"   Vaqt: {elapsed:.0f}s ({elapsed/60:.1f} min)")
 
-    # Final count
     cur.execute('SELECT COUNT(*) FROM "AlphaMissenseVariants"')
     final = cur.fetchone()[0]
     print(f"   DB da jami: {final:,} qator")
 
     conn.close()
-    print("\nService tugadi. Railway container o'chadi.")
+    print("\nService tugadi!")
 
 def normalize_class(raw: str) -> str:
     raw = raw.lower().strip()
